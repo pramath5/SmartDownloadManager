@@ -12,7 +12,6 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-
 def get_default_database_path():
     """Return the database path in Windows local AppData."""
     local_app_data = os.getenv("LOCALAPPDATA")
@@ -32,6 +31,48 @@ def get_default_database_path():
 
 class Database:
     """Manage SmartDownload AI's SQLite database."""
+
+    ALLOWED_TRANSITIONS = {
+        "detected": {
+            "processing",
+            "unsupported",
+            "cancelled",
+        },
+        "processing": {
+            "pending_review",
+            "error",
+            "unsupported",
+            "cancelled",
+        },
+        "pending_review": {
+            "approved",
+            "rejected",
+            "error",
+            "cancelled",
+        },
+        "approved": {
+            "organized",
+            "error",
+            "cancelled",
+        },
+        "organized": {"processing"},
+        "rejected": {"processing"},
+        "error": {"processing", "cancelled"},
+        "unsupported": {"processing", "cancelled"},
+        "cancelled": {"processing"},
+    }
+
+    VALID_STATUSES = {
+        "detected",
+        "processing",
+        "pending_review",
+        "approved",
+        "organized",
+        "rejected",
+        "error",
+        "unsupported",
+        "cancelled",
+    }
 
     def __init__(self, db_path=None):
         self.db_path = Path(
@@ -74,7 +115,6 @@ class Database:
     def initialize_database(self):
         """Create the required tables if absent."""
         with self.connection() as conn:
-
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +155,6 @@ class Database:
                         CHECK(is_active IN (0, 1)),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-
                     FOREIGN KEY (parent_folder_id)
                         REFERENCES folders(id)
                 )
@@ -138,10 +177,8 @@ class Database:
                     proposed_folder_id INTEGER,
                     proposed_path TEXT,
                     created_at TEXT NOT NULL,
-
                     FOREIGN KEY (file_id)
                         REFERENCES files(id),
-
                     FOREIGN KEY (proposed_folder_id)
                         REFERENCES folders(id)
                 )
@@ -171,10 +208,8 @@ class Database:
                     completed_at TEXT,
                     error_message TEXT,
                     undo_of_operation_id INTEGER,
-
                     FOREIGN KEY (file_id)
                         REFERENCES files(id),
-
                     FOREIGN KEY (undo_of_operation_id)
                         REFERENCES operations(id)
                 )
@@ -220,12 +255,7 @@ class Database:
 
             conn.execute("PRAGMA user_version = 1")
 
-    def add_file(
-        self,
-        file_path,
-        size_bytes,
-        content_hash=None
-    ):
+    def add_file(self, file_path, size_bytes, content_hash=None):
         """Register a file without modifying it."""
         path = Path(file_path).expanduser()
         now = utc_now()
@@ -233,27 +263,15 @@ class Database:
         with self.connection() as conn:
             cursor = conn.execute("""
                 INSERT INTO files (
-                    original_path,
-                    current_path,
-                    filename,
-                    extension,
-                    size_bytes,
-                    content_hash,
-                    status,
-                    detected_at,
-                    updated_at
+                    original_path, current_path, filename,
+                    extension, size_bytes, content_hash,
+                    status, detected_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                str(path),
-                str(path),
-                path.name,
-                path.suffix.lower(),
-                size_bytes,
-                content_hash,
-                "detected",
-                now,
-                now
+                str(path), str(path), path.name,
+                path.suffix.lower(), size_bytes, content_hash,
+                "detected", now, now
             ))
 
             return cursor.lastrowid
@@ -261,11 +279,10 @@ class Database:
     def get_file(self, file_id):
         """Retrieve one tracked file."""
         with self.connection() as conn:
-            row = conn.execute("""
-                SELECT *
-                FROM files
-                WHERE id = ?
-            """, (file_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM files WHERE id = ?",
+                (file_id,)
+            ).fetchone()
 
             return dict(row) if row else None
 
@@ -281,28 +298,40 @@ class Database:
 
             return [dict(row) for row in rows]
 
-    def update_file_status(
-        self,
-        file_id,
-        status,
-        error=None
-    ):
-        """Update the recorded processing status."""
-        with self.connection() as conn:
-            cursor = conn.execute("""
-                UPDATE files
-                SET status = ?,
-                    last_error = ?,
-                    updated_at = ?
-                WHERE id = ?
-            """, (
-                status,
-                error,
-                utc_now(),
-                file_id
-            ))
+    def update_file_status(self, file_id, status, error=None):
+        """Update a file status only when the transition is allowed."""
+        if status not in self.VALID_STATUSES:
+            raise ValueError(f"Unknown file status: {status}")
 
-            return cursor.rowcount > 0
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM files WHERE id = ?",
+                (file_id,)
+            ).fetchone()
+
+            if row is None:
+                return False
+
+            current_status = row["status"]
+
+            if status == current_status:
+                return True
+
+            if status not in self.ALLOWED_TRANSITIONS.get(
+                current_status, set()
+            ):
+                raise ValueError(
+                    f"Invalid status transition: "
+                    f"{current_status} -> {status}"
+                )
+
+            conn.execute("""
+                UPDATE files
+                SET status = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+            """, (status, error, utc_now(), file_id))
+
+            return True
 
     def add_classification(
         self,
@@ -317,21 +346,12 @@ class Database:
         model_name=None
     ):
         """Save an AI classification result."""
-        topics_json = json.dumps(topics or [])
-
         with self.connection() as conn:
             cursor = conn.execute("""
                 INSERT INTO classifications (
-                    file_id,
-                    model_name,
-                    category,
-                    subject,
-                    topics,
-                    summary,
-                    confidence,
-                    proposed_folder_id,
-                    proposed_path,
-                    created_at
+                    file_id, model_name, category, subject,
+                    topics, summary, confidence,
+                    proposed_folder_id, proposed_path, created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -339,7 +359,7 @@ class Database:
                 model_name,
                 category,
                 subject,
-                topics_json,
+                json.dumps(topics or []),
                 summary,
                 confidence,
                 proposed_folder_id,
@@ -364,9 +384,7 @@ class Database:
                 return None
 
             result = dict(row)
-            result["topics"] = json.loads(
-                result["topics"] or "[]"
-            )
+            result["topics"] = json.loads(result["topics"] or "[]")
             return result
 
     def add_folder(
@@ -375,28 +393,20 @@ class Database:
         description=None,
         parent_folder_id=None
     ):
-        """Register a folder profile without creating it."""
+        """Register folder metadata without creating a real folder."""
         path = Path(folder_path).expanduser()
         now = utc_now()
 
         with self.connection() as conn:
             cursor = conn.execute("""
                 INSERT INTO folders (
-                    path,
-                    display_name,
-                    description,
-                    parent_folder_id,
-                    created_at,
-                    updated_at
+                    path, display_name, description,
+                    parent_folder_id, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                str(path),
-                path.name,
-                description,
-                parent_folder_id,
-                now,
-                now
+                str(path), path.name, description,
+                parent_folder_id, now, now
             ))
 
             return cursor.lastrowid
@@ -414,12 +424,8 @@ class Database:
         with self.connection() as conn:
             cursor = conn.execute("""
                 INSERT INTO operations (
-                    file_id,
-                    operation_type,
-                    source_path,
-                    destination_path,
-                    status,
-                    approved_at,
+                    file_id, operation_type, source_path,
+                    destination_path, status, approved_at,
                     undo_of_operation_id
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -434,6 +440,129 @@ class Database:
             ))
 
             return cursor.lastrowid
+
+    def approve_operation(
+        self,
+        operation_id,
+        approved_source,
+        approved_destination
+    ):
+        """
+        Record explicit user approval for one exact move.
+
+        This records approval only; it does not move a file.
+        """
+        with self.connection() as conn:
+            operation = conn.execute("""
+                SELECT o.*, f.status AS file_status,
+                       f.current_path AS current_file_path
+                FROM operations AS o
+                JOIN files AS f ON f.id = o.file_id
+                WHERE o.id = ?
+            """, (operation_id,)).fetchone()
+
+            if operation is None:
+                raise ValueError("Operation does not exist.")
+
+            if operation["operation_type"] != "move":
+                raise ValueError(
+                    "Only move operations can be approved here."
+                )
+
+            if operation["status"] != "pending":
+                raise ValueError(
+                    "Only pending operations can be approved."
+                )
+
+            if operation["file_status"] != "pending_review":
+                raise ValueError(
+                    "The file must be pending review before approval."
+                )
+
+            source = str(Path(approved_source).expanduser())
+            destination = str(
+                Path(approved_destination).expanduser()
+            )
+
+            if source != operation["source_path"]:
+                raise ValueError(
+                    "Approved source does not match the operation."
+                )
+
+            if destination != operation["destination_path"]:
+                raise ValueError(
+                    "Approved destination does not match the operation."
+                )
+
+            if source != operation["current_file_path"]:
+                raise ValueError(
+                    "Operation source does not match the file's current path."
+                )
+
+            if source == destination:
+                raise ValueError(
+                    "Source and destination must be different."
+                )
+
+            now = utc_now()
+
+            conn.execute("""
+                UPDATE operations
+                SET approved_at = ?
+                WHERE id = ?
+            """, (now, operation_id))
+
+            conn.execute("""
+                UPDATE files
+                SET status = 'approved', updated_at = ?
+                WHERE id = ?
+            """, (now, operation["file_id"]))
+
+            return True
+
+    def is_operation_approved(
+        self,
+        operation_id,
+        intended_source,
+        intended_destination
+    ):
+        """
+        Verify approval for the exact recorded move.
+
+        This check does not perform a file operation.
+        """
+        source = str(Path(intended_source).expanduser())
+        destination = str(
+            Path(intended_destination).expanduser()
+        )
+
+        with self.connection() as conn:
+            row = conn.execute("""
+                SELECT o.approved_at,
+                       o.operation_type,
+                       o.status,
+                       o.source_path,
+                       o.destination_path,
+                       f.status AS file_status,
+                       f.current_path AS current_file_path
+                FROM operations AS o
+                JOIN files AS f ON f.id = o.file_id
+                WHERE o.id = ?
+            """, (operation_id,)).fetchone()
+
+            if row is None:
+                return False
+
+            return (
+                row["operation_type"] == "move"
+                and row["approved_at"] is not None
+                and row["status"] == "pending"
+                and row["file_status"] == "approved"
+                and row["source_path"] == source
+                and row["destination_path"] == destination
+                and row["current_file_path"] == source
+                and source != destination
+            )
 
     def get_operations_for_file(self, file_id):
         """Retrieve the operation history of one file."""
@@ -453,21 +582,13 @@ class Database:
 
         with self.connection() as conn:
             conn.execute("""
-                INSERT INTO settings (
-                    key,
-                    value,
-                    updated_at
-                )
+                INSERT INTO settings (key, value, updated_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(key)
                 DO UPDATE SET
                     value = excluded.value,
                     updated_at = excluded.updated_at
-            """, (
-                key,
-                serialized,
-                utc_now()
-            ))
+            """, (key, serialized, utc_now()))
 
     def get_setting(self, key, default=None):
         """Retrieve a setting and decode its JSON value."""
